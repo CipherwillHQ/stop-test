@@ -11,10 +11,12 @@
     "@apollo/server": "^4.13.0",
     "@prisma/adapter-better-sqlite3": "^7.8.0",
     "@prisma/client": "^7.8.0",
+    "bullmq": "^5.79.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^4.21.0",
-    "graphql": "^16.14.2"
+    "graphql": "^16.14.2",
+    "ioredis": "^5.11.1"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",

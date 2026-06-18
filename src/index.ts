@@ -4,20 +4,56 @@ import { Server } from "http";
 import { ApolloServer } from "@apollo/server";
 import { expressMiddleware } from "@apollo/server/express4";
 import cors from "cors";
+import Redis from "ioredis";
+import { Queue, Worker, Job } from "bullmq";
 import { PrismaBetterSqlite3 } from "@prisma/adapter-better-sqlite3";
 import { PrismaClient } from "./generated/prisma/client";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+
+const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
 
 const adapter = new PrismaBetterSqlite3({ url: process.env["DATABASE_URL"] || "file:./dev.db" });
 const prisma = new PrismaClient({ adapter });
+
+const redisUrl = new URL(REDIS_URL);
+const connection = {
+  host: redisUrl.hostname,
+  port: Number(redisUrl.port) || 6379,
+  password: redisUrl.password || undefined,
+};
+
+const notificationQueue = new Queue("notifications", { connection });
+const notificationWorker = new Worker(
+  "notifications",
+  async (job: Job) => {
+    console.log(`Processing notification job ${job.id}:`, job.data);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    console.log(`Notification job ${job.id} completed`);
+  },
+  { connection },
+);
+
+notificationWorker.on("completed", (job: Job) => {
+  console.log(`Job ${job.id} completed successfully`);
+});
+
+notificationWorker.on("failed", (job: Job | undefined, err: Error) => {
+  console.error(`Job ${job?.id} failed:`, err.message);
+});
 
 const typeDefs = `#graphql
   type User {
     id: Int!
     name: String!
     email: String!
+  }
+
+  type JobResult {
+    jobId: String!
+    message: String!
   }
 
   type Query {
@@ -27,6 +63,7 @@ const typeDefs = `#graphql
 
   type Mutation {
     createUser(name: String!, email: String!): User!
+    enqueueNotification(message: String!): JobResult!
   }
 `;
 
@@ -39,6 +76,16 @@ const resolvers = {
   Mutation: {
     createUser: (_: unknown, args: { name: string; email: string }) =>
       prisma.user.create({ data: { name: args.name, email: args.email } }),
+    enqueueNotification: async (_: unknown, args: { message: string }) => {
+      const job = await notificationQueue.add("send-notification", {
+        message: args.message,
+        timestamp: new Date().toISOString(),
+      });
+      return {
+        jobId: job.id!,
+        message: `Notification job ${job.id} queued`,
+      };
+    },
   },
 };
 
@@ -58,6 +105,7 @@ async function start() {
   app.get("/health", async (_req, res) => {
     try {
       await prisma.$queryRaw`SELECT 1`;
+      await redis.ping();
       res.status(200).send("OK");
     } catch {
       res.status(503).send("Unhealthy");
@@ -77,19 +125,35 @@ async function start() {
     console.log(`\nReceived ${signal}. Waiting 5 seconds before shutting down...`);
 
     setTimeout(async () => {
-      console.log("Stopping Apollo Server...");
-      await apollo.stop();
-      console.log("Disconnecting Prisma...");
-      await prisma.$disconnect();
-      console.log("Closing HTTP server...");
-      httpServer.close((err) => {
-        if (err) {
-          console.error("Error during shutdown:", err);
-          process.exit(1);
-        }
-        console.log("Server closed gracefully");
-        process.exit(0);
-      });
+      try {
+        console.log("Stopping Apollo Server...");
+        await apollo.stop();
+
+        console.log("Closing BullMQ worker...");
+        await notificationWorker.close();
+
+        console.log("Closing BullMQ queue...");
+        await notificationQueue.close();
+
+        console.log("Disconnecting Redis...");
+        redis.disconnect();
+
+        console.log("Disconnecting Prisma...");
+        await prisma.$disconnect();
+
+        console.log("Closing HTTP server...");
+        httpServer.close((err) => {
+          if (err) {
+            console.error("Error during shutdown:", err);
+            process.exit(1);
+          }
+          console.log("Server closed gracefully");
+          process.exit(0);
+        });
+      } catch (err) {
+        console.error("Error during shutdown:", err);
+        process.exit(1);
+      }
 
       setTimeout(() => {
         console.error("Forced shutdown after timeout");
