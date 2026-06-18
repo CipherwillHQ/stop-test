@@ -5,7 +5,9 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 require("dotenv/config");
 const express_1 = __importDefault(require("express"));
+const http_1 = __importDefault(require("http"));
 const server_1 = require("@apollo/server");
+const drainHttpServer_1 = require("@apollo/server/plugin/drainHttpServer");
 const express4_1 = require("@apollo/server/express4");
 const cors_1 = __importDefault(require("cors"));
 const ioredis_1 = __importDefault(require("ioredis"));
@@ -15,6 +17,7 @@ const client_1 = require("./generated/prisma/client");
 const app = (0, express_1.default)();
 const PORT = Number(process.env.PORT) || 3000;
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+const httpServer = http_1.default.createServer(app);
 const redis = new ioredis_1.default(REDIS_URL, { maxRetriesPerRequest: null });
 const adapter = new adapter_better_sqlite3_1.PrismaBetterSqlite3({ url: process.env["DATABASE_URL"] || "file:./dev.db" });
 const prisma = new client_1.PrismaClient({ adapter });
@@ -77,7 +80,12 @@ const resolvers = {
         },
     },
 };
-const apollo = new server_1.ApolloServer({ typeDefs, resolvers, stopOnTerminationSignals: false });
+const apollo = new server_1.ApolloServer({
+    typeDefs,
+    resolvers,
+    plugins: [(0, drainHttpServer_1.ApolloServerPluginDrainHttpServer)({ httpServer })],
+    stopOnTerminationSignals: false,
+});
 async function start() {
     await apollo.start();
     app.use((0, cors_1.default)());
@@ -96,11 +104,11 @@ async function start() {
             res.status(503).send("Unhealthy");
         }
     });
-    const httpServer = app.listen(PORT, () => {
-        console.log(`Server listening on port ${PORT}`);
-        console.log(`GraphQL endpoint: http://localhost:${PORT}/graphql`);
-    });
-    // Simulate backend's slow startup (DB connect, migrations, Apollo drain plugin setup, cron init)
+    await new Promise((resolve) => httpServer.listen(PORT, resolve));
+    console.log(`Server listening on port ${PORT}`);
+    console.log(`GraphQL endpoint: http://localhost:${PORT}/graphql`);
+    // Simulate backend's slow startup AFTER server listen
+    // (DB connect, migrations, cron init — all happen after listen, before handler registration)
     // During this gap, if SIGTERM arrives there is NO handler registered → exit 143.
     // Set STARTUP_DELAY_MS env var to control the gap.
     const startupDelay = Number(process.env["STARTUP_DELAY_MS"]) || 0;
@@ -145,19 +153,15 @@ async function start() {
         isShuttingDown = true;
         console.log(`[Shutdown] Received ${signal}. Starting graceful shutdown... | Process PID: ${process.pid}`);
         // === DIAGNOSTIC: Test shutdown window ===
-        const shutdownDelay = Number(process.env["SHUTDOWN_DELAY_MS"]) || 0;
-        if (shutdownDelay > 0) {
-            process.stdout.write(`[Shutdown] Sleeping ${shutdownDelay}ms to test shutdown window...\n`);
-            await new Promise((resolve) => setTimeout(resolve, shutdownDelay));
-            process.stdout.write("[Shutdown] Sleep done. Proceeding with shutdown.\n");
-        }
+        const shutdownDelay = Number(process.env["SHUTDOWN_DELAY_MS"]) || 5000;
+        process.stdout.write(`[Shutdown] Sleeping ${shutdownDelay}ms to test shutdown window...\n`);
+        await new Promise((resolve) => setTimeout(resolve, shutdownDelay));
+        process.stdout.write("[Shutdown] Sleep done. Proceeding with shutdown.\n");
         // === END DIAGNOSTIC ===
         // Disable offline queueing on Redis connection during shutdown
-        // NOTE: this causes redis.quit() to fail with "Stream isn't writeable" if connection is already bad.
-        // Consider removing this or catching the error gracefully.
-        // if (redis.options) {
-        //   redis.options.enableOfflineQueue = false;
-        // }
+        if (redis.options) {
+            redis.options.enableOfflineQueue = false;
+        }
         // Set a watchdog timeout of 28 seconds
         const watchdog = setTimeout(async () => {
             console.error("[Shutdown] Graceful shutdown watchdog timed out. Forcing process exit.");

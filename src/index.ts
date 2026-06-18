@@ -1,7 +1,8 @@
 import "dotenv/config";
 import express from "express";
-import { Server } from "http";
+import http from "http";
 import { ApolloServer } from "@apollo/server";
+import { ApolloServerPluginDrainHttpServer } from "@apollo/server/plugin/drainHttpServer";
 import { expressMiddleware } from "@apollo/server/express4";
 import cors from "cors";
 import Redis from "ioredis";
@@ -12,6 +13,7 @@ import { PrismaClient } from "./generated/prisma/client";
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+const httpServer = http.createServer(app);
 
 const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
 
@@ -89,7 +91,12 @@ const resolvers = {
   },
 };
 
-const apollo = new ApolloServer({ typeDefs, resolvers, stopOnTerminationSignals: false });
+const apollo = new ApolloServer({
+  typeDefs,
+  resolvers,
+  plugins: [ApolloServerPluginDrainHttpServer({ httpServer })],
+  stopOnTerminationSignals: false,
+});
 
 async function start() {
   await apollo.start();
@@ -112,12 +119,12 @@ async function start() {
     }
   });
 
-  const httpServer: Server = app.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
-    console.log(`GraphQL endpoint: http://localhost:${PORT}/graphql`);
-  });
+  await new Promise<void>((resolve) => httpServer.listen(PORT, resolve));
+  console.log(`Server listening on port ${PORT}`);
+  console.log(`GraphQL endpoint: http://localhost:${PORT}/graphql`);
 
-  // Simulate backend's slow startup (DB connect, migrations, Apollo drain plugin setup, cron init)
+  // Simulate backend's slow startup AFTER server listen
+  // (DB connect, migrations, cron init — all happen after listen, before handler registration)
   // During this gap, if SIGTERM arrives there is NO handler registered → exit 143.
   // Set STARTUP_DELAY_MS env var to control the gap.
   const startupDelay = Number(process.env["STARTUP_DELAY_MS"]) || 0;
@@ -165,20 +172,16 @@ async function start() {
     console.log(`[Shutdown] Received ${signal}. Starting graceful shutdown... | Process PID: ${process.pid}`);
 
     // === DIAGNOSTIC: Test shutdown window ===
-    const shutdownDelay = Number(process.env["SHUTDOWN_DELAY_MS"]) || 0;
-    if (shutdownDelay > 0) {
-      process.stdout.write(`[Shutdown] Sleeping ${shutdownDelay}ms to test shutdown window...\n`);
-      await new Promise((resolve) => setTimeout(resolve, shutdownDelay));
-      process.stdout.write("[Shutdown] Sleep done. Proceeding with shutdown.\n");
-    }
+    const shutdownDelay = Number(process.env["SHUTDOWN_DELAY_MS"]) || 5000;
+    process.stdout.write(`[Shutdown] Sleeping ${shutdownDelay}ms to test shutdown window...\n`);
+    await new Promise((resolve) => setTimeout(resolve, shutdownDelay));
+    process.stdout.write("[Shutdown] Sleep done. Proceeding with shutdown.\n");
     // === END DIAGNOSTIC ===
 
     // Disable offline queueing on Redis connection during shutdown
-    // NOTE: this causes redis.quit() to fail with "Stream isn't writeable" if connection is already bad.
-    // Consider removing this or catching the error gracefully.
-    // if (redis.options) {
-    //   redis.options.enableOfflineQueue = false;
-    // }
+    if (redis.options) {
+      redis.options.enableOfflineQueue = false;
+    }
 
     // Set a watchdog timeout of 28 seconds
     const watchdog = setTimeout(async () => {

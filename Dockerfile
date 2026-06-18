@@ -16,7 +16,7 @@ RUN npx prisma db push
 RUN npm run build
 RUN npm prune --omit=dev
 
-FROM gcr.io/distroless/nodejs22-debian12 AS runner
+FROM node:22-bookworm-slim AS runner
 
 WORKDIR /app
 
@@ -29,6 +29,6 @@ EXPOSE 3000
 ENV DATABASE_URL="file:./dev.db"
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD ["/nodejs/bin/node", "dist/healthcheck.js"]
+  CMD ["node", "dist/healthcheck.js"]
 
-CMD ["dist/index.js"]
+CMD ["node", "dist/index.js"]
