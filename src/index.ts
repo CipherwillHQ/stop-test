@@ -10,7 +10,7 @@ import { PrismaClient } from "./generated/prisma/client";
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-const adapter = new PrismaBetterSqlite3({ url: "file:./prisma/dev.db" });
+const adapter = new PrismaBetterSqlite3({ url: process.env["DATABASE_URL"] || "file:./dev.db" });
 const prisma = new PrismaClient({ adapter });
 
 const typeDefs = `#graphql
