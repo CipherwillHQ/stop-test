@@ -172,7 +172,9 @@ async function start() {
     console.log(`[Shutdown] Received ${signal}. Starting graceful shutdown... | Process PID: ${process.pid}`);
 
     // === DIAGNOSTIC: Test shutdown window ===
-    const shutdownDelay = Number(process.env["SHUTDOWN_DELAY_MS"]) || 5000;
+    // We set a default of 15000ms (15 seconds) to simulate a slow real-world backend shutdown
+    // that exceeds Docker/Dokploy's default 10-second stop timeout.
+    const shutdownDelay = Number(process.env["SHUTDOWN_DELAY_MS"]) || 15000;
     process.stdout.write(`[Shutdown] Sleeping ${shutdownDelay}ms to test shutdown window...\n`);
     await new Promise((resolve) => setTimeout(resolve, shutdownDelay));
     process.stdout.write("[Shutdown] Sleep done. Proceeding with shutdown.\n");
