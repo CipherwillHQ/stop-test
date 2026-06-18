@@ -135,9 +135,10 @@ async function start() {
         }
         isShuttingDown = true;
         console.log(`[Shutdown] Received ${signal}. Starting graceful shutdown... | Process PID: ${process.pid}`);
-        // === DIAGNOSTIC: Test if Dokploy gives us enough time ===
-        process.stdout.write("[Shutdown] Sleeping 5 seconds to test Dokploy shutdown window...\n");
-        await new Promise((resolve) => setTimeout(resolve, 5000));
+        // === DIAGNOSTIC: Test shutdown window ===
+        const shutdownDelay = Number(process.env["SHUTDOWN_DELAY_MS"]) || 5000;
+        process.stdout.write(`[Shutdown] Sleeping ${shutdownDelay}ms to test shutdown window...\n`);
+        await new Promise((resolve) => setTimeout(resolve, shutdownDelay));
         process.stdout.write("[Shutdown] Sleep done. Proceeding with shutdown.\n");
         // === END DIAGNOSTIC ===
         // Disable offline queueing on Redis connection during shutdown
@@ -154,9 +155,17 @@ async function start() {
         let hasErrors = false;
         const tasks = [
             {
+                name: "Cron Jobs",
+                timeout: 2000,
+                run: () => { },
+            },
+            {
                 name: "BullMQ Worker",
                 timeout: 10000,
                 run: async () => {
+                    // Simulate waiting for active jobs to drain (backend may have real jobs)
+                    console.log("[Shutdown] Worker simulating active job drain (3s)...");
+                    await new Promise((resolve) => setTimeout(resolve, 3000));
                     try {
                         await notificationWorker.close();
                     }
@@ -174,14 +183,19 @@ async function start() {
                 run: () => notificationQueue.close(),
             },
             {
-                name: "Redis Connection",
+                name: "Redis Connections",
                 timeout: 2000,
                 run: () => redis.quit(),
             },
             {
                 name: "Prisma Client",
                 timeout: 2000,
-                run: () => prisma.$disconnect(),
+                run: async () => {
+                    // Simulate MariaDB disconnect latency (vs instant SQLite)
+                    console.log("[Shutdown] Prisma simulating disconnect delay (1s)...");
+                    await new Promise((resolve) => setTimeout(resolve, 1000));
+                    await prisma.$disconnect();
+                },
             },
             {
                 name: "HTTP and Apollo Server",
@@ -223,13 +237,13 @@ async function start() {
         }
         return handleShutdown("SIGINT");
     });
-    process.on("SIGTERM", () => {
-        if (isShuttingDown) {
-            process.stdout.write("[Shutdown] SECOND SIGTERM received. Force exit.\n");
-            process.exit(1);
-        }
-        return handleShutdown("SIGTERM");
-    });
+    // process.on("SIGTERM", () => {
+    //   if (isShuttingDown) {
+    //     process.stdout.write("[Shutdown] SECOND SIGTERM received. Force exit.\n");
+    //     process.exit(1);
+    //   }
+    //   return handleShutdown("SIGTERM");
+    // });
 }
 start().catch((err) => {
     console.error("Failed to start server:", err);
