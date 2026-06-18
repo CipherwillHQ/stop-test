@@ -120,7 +120,7 @@ async function start() {
   });
 
   await new Promise<void>((resolve) => httpServer.listen(PORT, resolve));
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Server listening on port ${PORT} | Process PID: ${process.pid}`);
   console.log(`GraphQL endpoint: http://localhost:${PORT}/graphql`);
 
   // Simulate backend's slow startup AFTER server listen
