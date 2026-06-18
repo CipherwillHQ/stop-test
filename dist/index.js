@@ -100,6 +100,15 @@ async function start() {
         console.log(`Server listening on port ${PORT}`);
         console.log(`GraphQL endpoint: http://localhost:${PORT}/graphql`);
     });
+    // Simulate backend's slow startup (DB connect, migrations, Apollo drain plugin setup, cron init)
+    // During this gap, if SIGTERM arrives there is NO handler registered → exit 143.
+    // Set STARTUP_DELAY_MS env var to control the gap.
+    const startupDelay = Number(process.env["STARTUP_DELAY_MS"]) || 0;
+    if (startupDelay > 0) {
+        console.log(`[Startup] Simulating backend init gap of ${startupDelay}ms (handler not yet registered)...`);
+        await new Promise((resolve) => setTimeout(resolve, startupDelay));
+        console.log("[Startup] Init complete. Registering shutdown handlers now.");
+    }
     let isShuttingDown = false;
     async function flushStdoutAndStderr() {
         await new Promise((resolve) => {
@@ -136,15 +145,19 @@ async function start() {
         isShuttingDown = true;
         console.log(`[Shutdown] Received ${signal}. Starting graceful shutdown... | Process PID: ${process.pid}`);
         // === DIAGNOSTIC: Test shutdown window ===
-        const shutdownDelay = Number(process.env["SHUTDOWN_DELAY_MS"]) || 5000;
-        process.stdout.write(`[Shutdown] Sleeping ${shutdownDelay}ms to test shutdown window...\n`);
-        await new Promise((resolve) => setTimeout(resolve, shutdownDelay));
-        process.stdout.write("[Shutdown] Sleep done. Proceeding with shutdown.\n");
+        const shutdownDelay = Number(process.env["SHUTDOWN_DELAY_MS"]) || 0;
+        if (shutdownDelay > 0) {
+            process.stdout.write(`[Shutdown] Sleeping ${shutdownDelay}ms to test shutdown window...\n`);
+            await new Promise((resolve) => setTimeout(resolve, shutdownDelay));
+            process.stdout.write("[Shutdown] Sleep done. Proceeding with shutdown.\n");
+        }
         // === END DIAGNOSTIC ===
         // Disable offline queueing on Redis connection during shutdown
-        if (redis.options) {
-            redis.options.enableOfflineQueue = false;
-        }
+        // NOTE: this causes redis.quit() to fail with "Stream isn't writeable" if connection is already bad.
+        // Consider removing this or catching the error gracefully.
+        // if (redis.options) {
+        //   redis.options.enableOfflineQueue = false;
+        // }
         // Set a watchdog timeout of 28 seconds
         const watchdog = setTimeout(async () => {
             console.error("[Shutdown] Graceful shutdown watchdog timed out. Forcing process exit.");
@@ -155,17 +168,9 @@ async function start() {
         let hasErrors = false;
         const tasks = [
             {
-                name: "Cron Jobs",
-                timeout: 2000,
-                run: () => { },
-            },
-            {
                 name: "BullMQ Worker",
                 timeout: 10000,
                 run: async () => {
-                    // Simulate waiting for active jobs to drain (backend may have real jobs)
-                    console.log("[Shutdown] Worker simulating active job drain (3s)...");
-                    await new Promise((resolve) => setTimeout(resolve, 3000));
                     try {
                         await notificationWorker.close();
                     }
@@ -183,19 +188,14 @@ async function start() {
                 run: () => notificationQueue.close(),
             },
             {
-                name: "Redis Connections",
+                name: "Redis Connection",
                 timeout: 2000,
                 run: () => redis.quit(),
             },
             {
                 name: "Prisma Client",
                 timeout: 2000,
-                run: async () => {
-                    // Simulate MariaDB disconnect latency (vs instant SQLite)
-                    console.log("[Shutdown] Prisma simulating disconnect delay (1s)...");
-                    await new Promise((resolve) => setTimeout(resolve, 1000));
-                    await prisma.$disconnect();
-                },
+                run: () => prisma.$disconnect(),
             },
             {
                 name: "HTTP and Apollo Server",
@@ -237,13 +237,13 @@ async function start() {
         }
         return handleShutdown("SIGINT");
     });
-    // process.on("SIGTERM", () => {
-    //   if (isShuttingDown) {
-    //     process.stdout.write("[Shutdown] SECOND SIGTERM received. Force exit.\n");
-    //     process.exit(1);
-    //   }
-    //   return handleShutdown("SIGTERM");
-    // });
+    process.on("SIGTERM", () => {
+        if (isShuttingDown) {
+            process.stdout.write("[Shutdown] SECOND SIGTERM received. Force exit.\n");
+            process.exit(1);
+        }
+        return handleShutdown("SIGTERM");
+    });
 }
 start().catch((err) => {
     console.error("Failed to start server:", err);
