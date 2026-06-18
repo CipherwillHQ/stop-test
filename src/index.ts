@@ -89,7 +89,7 @@ const resolvers = {
   },
 };
 
-const apollo = new ApolloServer({ typeDefs, resolvers });
+const apollo = new ApolloServer({ typeDefs, resolvers, stopOnTerminationSignals: false });
 
 async function start() {
   await apollo.start();
@@ -117,53 +117,144 @@ async function start() {
     console.log(`GraphQL endpoint: http://localhost:${PORT}/graphql`);
   });
 
-  let shuttingDown = false;
+  let isShuttingDown = false;
 
-  async function gracefulShutdown(signal: string) {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.log(`\nReceived ${signal}. Waiting 5 seconds before shutting down...`);
-
-    setTimeout(async () => {
-      try {
-        console.log("Stopping Apollo Server...");
-        await apollo.stop();
-
-        console.log("Closing BullMQ worker...");
-        await notificationWorker.close();
-
-        console.log("Closing BullMQ queue...");
-        await notificationQueue.close();
-
-        console.log("Disconnecting Redis...");
-        redis.disconnect();
-
-        console.log("Disconnecting Prisma...");
-        await prisma.$disconnect();
-
-        console.log("Closing HTTP server...");
-        httpServer.close((err) => {
-          if (err) {
-            console.error("Error during shutdown:", err);
-            process.exit(1);
-          }
-          console.log("Server closed gracefully");
-          process.exit(0);
-        });
-      } catch (err) {
-        console.error("Error during shutdown:", err);
-        process.exit(1);
+  async function flushStdoutAndStderr() {
+    await new Promise<void>((resolve) => {
+      let completed = 0;
+      const done = () => {
+        if (++completed === 2) resolve();
+      };
+      if (!process.stdout.write("")) {
+        process.stdout.once("drain", done);
+      } else {
+        process.nextTick(done);
       }
-
-      setTimeout(() => {
-        console.error("Forced shutdown after timeout");
-        process.exit(1);
-      }, 5000);
-    }, 5000);
+      if (!process.stderr.write("")) {
+        process.stderr.once("drain", done);
+      } else {
+        process.nextTick(done);
+      }
+    });
   }
 
-  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+  function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) => setTimeout(() => reject(new Error(errorMessage)), timeoutMs)),
+    ]);
+  }
+
+  async function handleShutdown(signal: string) {
+    if (isShuttingDown) {
+      console.log(`[Shutdown] Received ${signal}, but shutdown is already in progress... | Process PID: ${process.pid}`);
+      return;
+    }
+
+    isShuttingDown = true;
+    console.log(`[Shutdown] Received ${signal}. Starting graceful shutdown... | Process PID: ${process.pid}`);
+
+    // === DIAGNOSTIC: Test if Dokploy gives us enough time ===
+    process.stdout.write("[Shutdown] Sleeping 5 seconds to test Dokploy shutdown window...\n");
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    process.stdout.write("[Shutdown] Sleep done. Proceeding with shutdown.\n");
+    // === END DIAGNOSTIC ===
+
+    // Disable offline queueing on Redis connection during shutdown
+    if (redis.options) {
+      redis.options.enableOfflineQueue = false;
+    }
+
+    // Set a watchdog timeout of 28 seconds
+    const watchdog = setTimeout(async () => {
+      console.error("[Shutdown] Graceful shutdown watchdog timed out. Forcing process exit.");
+      await flushStdoutAndStderr();
+      process.exit(1);
+    }, 28000);
+    watchdog.unref();
+
+    let hasErrors = false;
+
+    const tasks = [
+      {
+        name: "BullMQ Worker",
+        timeout: 10000,
+        run: async () => {
+          try {
+            await notificationWorker.close();
+          } finally {
+            try { redis.disconnect(); } catch (_err) {}
+          }
+        },
+      },
+      {
+        name: "BullMQ Queue",
+        timeout: 2000,
+        run: () => notificationQueue.close(),
+      },
+      {
+        name: "Redis Connection",
+        timeout: 2000,
+        run: () => redis.quit(),
+      },
+      {
+        name: "Prisma Client",
+        timeout: 2000,
+        run: () => prisma.$disconnect(),
+      },
+      {
+        name: "HTTP and Apollo Server",
+        timeout: 3000,
+        run: async () => {
+          if (httpServer) {
+            httpServer.close();
+            if (typeof (httpServer as any).closeAllConnections === "function") {
+              (httpServer as any).closeAllConnections();
+            }
+          }
+          await apollo.stop();
+        },
+      },
+    ];
+
+    for (const task of tasks) {
+      try {
+        console.log(`[Shutdown] Stopping ${task.name}...`);
+        await withTimeout(Promise.resolve(task.run()), task.timeout, `Timeout stopping ${task.name}`);
+        console.log(`[Shutdown] ${task.name} stopped.`);
+      } catch (err) {
+        hasErrors = true;
+        console.error(
+          `[Shutdown] Failed to stop ${task.name}:`,
+          err instanceof Error ? err.message : String(err)
+        );
+      }
+    }
+
+    console.log("[Shutdown] Graceful shutdown completed successfully.");
+    clearTimeout(watchdog);
+    await flushStdoutAndStderr();
+    process.exit(hasErrors ? 1 : 0);
+  }
+
+  process.on("unhandledRejection", (reason) => {
+    process.stdout.write(`[Shutdown] Unhandled rejection during shutdown: ${reason}\n`);
+  });
+
+  process.on("SIGINT", () => {
+    if (isShuttingDown) {
+      process.stdout.write("[Shutdown] SECOND SIGINT received. Force exit.\n");
+      process.exit(1);
+    }
+    return handleShutdown("SIGINT");
+  });
+  process.on("SIGTERM", () => {
+    if (isShuttingDown) {
+      process.stdout.write("[Shutdown] SECOND SIGTERM received. Force exit.\n");
+      process.exit(1);
+    }
+    return handleShutdown("SIGTERM");
+  });
 }
 
 start().catch((err) => {
